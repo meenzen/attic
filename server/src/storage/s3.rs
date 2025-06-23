@@ -3,7 +3,10 @@
 use std::time::Duration;
 
 use async_trait::async_trait;
-use aws_config::BehaviorVersion;
+use aws_config::{
+    retry::{RetryConfig},
+    BehaviorVersion,
+};
 use aws_sdk_s3::{
     config::Builder as S3ConfigBuilder,
     config::{Credentials, Region},
@@ -80,9 +83,15 @@ pub struct S3RemoteFile {
 
 impl S3Backend {
     pub async fn new(config: S3StorageConfig) -> ServerResult<Self> {
+        let retry_config = RetryConfig::adaptive()
+            .with_initial_backoff(Duration::from_secs(2))
+            .with_max_backoff(Duration::from_secs(30))
+            .with_max_attempts(10);
+
         let s3_config = Self::config_builder(&config)
             .await?
             .region(Region::new(config.region.to_owned()))
+            .retry_config(retry_config)
             .build();
 
         Ok(Self {
