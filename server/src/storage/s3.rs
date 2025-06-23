@@ -1,12 +1,9 @@
 //! S3 remote files.
 
-use std::time::Duration;
+use std::{num::NonZeroU32, sync::Arc, time::Duration};
 
 use async_trait::async_trait;
-use aws_config::{
-    retry::{RetryConfig},
-    BehaviorVersion,
-};
+use aws_config::{retry::RetryConfig, BehaviorVersion};
 use aws_sdk_s3::{
     config::Builder as S3ConfigBuilder,
     config::{Credentials, Region},
@@ -17,8 +14,14 @@ use aws_sdk_s3::{
 };
 use bytes::BytesMut;
 use futures::future::join_all;
+use governor::{
+    clock::{QuantaClock, QuantaInstant},
+    middleware::NoOpMiddleware,
+    state::{InMemoryState, NotKeyed},
+    Quota, RateLimiter,
+};
 use serde::{Deserialize, Serialize};
-use tokio::io::AsyncRead;
+use tokio::{io::AsyncRead, sync::Semaphore};
 
 use super::{Download, RemoteFile, StorageBackend};
 use crate::error::{ErrorKind, ServerError, ServerResult};
@@ -33,6 +36,8 @@ const CHUNK_SIZE: usize = 8 * 1024 * 1024;
 pub struct S3Backend {
     client: Client,
     config: S3StorageConfig,
+    semaphore: Arc<Semaphore>,
+    rate_limiter: RateLimiter<NotKeyed, InMemoryState, QuantaClock, NoOpMiddleware<QuantaInstant>>,
 }
 
 /// S3 remote file storage configuration.
@@ -94,9 +99,14 @@ impl S3Backend {
             .retry_config(retry_config)
             .build();
 
+        let semaphore = Arc::new(Semaphore::new(100));
+        let rate_limiter = RateLimiter::direct(Quota::per_second(NonZeroU32::new(250).unwrap()));
+
         Ok(Self {
             client: Client::from_conf(s3_config),
             config,
+            semaphore,
+            rate_limiter,
         })
     }
 
@@ -186,6 +196,9 @@ impl StorageBackend for S3Backend {
             .map_err(ServerError::storage_error)?;
 
         if first_chunk.len() < CHUNK_SIZE {
+            let _ = self.semaphore.acquire().await.unwrap();
+            self.rate_limiter.until_ready().await;
+
             // do a normal PutObject
             let put_object = self
                 .client
@@ -258,6 +271,9 @@ impl StorageBackend for S3Backend {
                 break;
             }
 
+            let _ = self.semaphore.acquire().await.unwrap();
+            self.rate_limiter.until_ready().await;
+
             let client = self.client.clone();
             let fut = tokio::task::spawn({
                 client
@@ -322,6 +338,9 @@ impl StorageBackend for S3Backend {
     }
 
     async fn delete_file(&self, name: String) -> ServerResult<()> {
+        let _ = self.semaphore.acquire().await.unwrap();
+        self.rate_limiter.until_ready().await;
+
         let deletion = self
             .client
             .delete_object()
@@ -337,6 +356,9 @@ impl StorageBackend for S3Backend {
     }
 
     async fn delete_file_db(&self, file: &RemoteFile) -> ServerResult<()> {
+        let _ = self.semaphore.acquire().await.unwrap();
+        self.rate_limiter.until_ready().await;
+
         let (client, file) = self.get_client_from_db_ref(file).await?;
 
         let deletion = client
@@ -353,6 +375,9 @@ impl StorageBackend for S3Backend {
     }
 
     async fn download_file(&self, name: String, prefer_stream: bool) -> ServerResult<Download> {
+        let _ = self.semaphore.acquire().await.unwrap();
+        self.rate_limiter.until_ready().await;
+
         let req = self
             .client
             .get_object()
@@ -367,6 +392,9 @@ impl StorageBackend for S3Backend {
         file: &RemoteFile,
         prefer_stream: bool,
     ) -> ServerResult<Download> {
+        let _ = self.semaphore.acquire().await.unwrap();
+        self.rate_limiter.until_ready().await;
+
         let (client, file) = self.get_client_from_db_ref(file).await?;
 
         let req = client.get_object().bucket(&file.bucket).key(&file.key);
